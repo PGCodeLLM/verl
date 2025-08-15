@@ -112,6 +112,7 @@ class AgentLoopMetrics(BaseModel):
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
+    stop_reason: str = ""
 
 
 class AgentLoopOutput(BaseModel):
@@ -127,6 +128,8 @@ class AgentLoopOutput(BaseModel):
     """Multi-modal data for multi-modal tools."""
     num_turns: int = 0
     """Number of chat turns, including user, assistant, tool."""
+    reward: float = 0.0
+    """Reward for the agent loop."""
     metrics: AgentLoopMetrics
     """Auxiliary performance metrics"""
 
@@ -318,11 +321,25 @@ class AgentLoopWorker:
             batch.meta_info.get("global_steps", -1), index, batch.meta_info.get("validate", False)
         )
 
-        tasks = []
+        pending_tasks: list[asyncio.Coroutine] = []
+        running_tasks: list[asyncio.Task] = []
+        outputs: list[_InternalAgentLoopOutput] = []
         for i in range(len(batch)):
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-            tasks.append(asyncio.create_task(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs)))
-        outputs = await asyncio.gather(*tasks)
+            pending_tasks.append(self._run_agent_loop(sampling_params, trajectory_info[i], **kwargs))
+
+        num_parallel_agents = config.get("num_parallel_agents_per_worker", len(batch))
+        while len(pending_tasks) + len(running_tasks) > 0:
+            if len(running_tasks) < num_parallel_agents and len(pending_tasks) > 0:
+                for i in range(min(num_parallel_agents - len(running_tasks), len(pending_tasks))):
+                    running_tasks.append(asyncio.create_task(pending_tasks.pop(0)))
+            if len(running_tasks) > 0:
+                completed_tasks = [task for task in running_tasks if task.done()]
+                for task in completed_tasks:
+                    outputs.append(task.result())
+                    running_tasks.remove(task)
+            logger.info(f"{ray.runtime_context.get_actor_name()}: Pending tasks: {len(pending_tasks)}, Running tasks: {len(running_tasks)}")
+            await asyncio.sleep(10)
 
         output = self._postprocess(outputs)
         return output
@@ -540,12 +557,8 @@ class AgentLoopManager:
         self.rollout_tp_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
         self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
 
-        workers_info = ray.get(
-            [
-                worker.__ray_call__.remote(lambda self: ray.get_runtime_context().get_node_id())
-                for worker in self.worker_group.workers
-            ]
-        )
+        register_center = ray.get_actor(f"{self.worker_group.name_prefix}_register_center")
+        workers_info = ray.get(register_center.get_worker_info.remote())
         self.rollout_dp_size = self.worker_group.world_size // self.rollout_tp_size
         # Store the node IDs for the servers
         self.server_node_ids = [workers_info[i * self.rollout_tp_size] for i in range(self.rollout_dp_size)]
