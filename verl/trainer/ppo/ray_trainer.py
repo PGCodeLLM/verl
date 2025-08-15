@@ -37,9 +37,8 @@ from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
-from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
@@ -1122,6 +1121,14 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("index")
                 if "agent_name" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
+
+                # add additional kwargs to batch
+                additional_kwargs = self.config.actor_rollout_ref.rollout.agent.get("additional_kwargs", "")
+                if additional_kwargs:
+                    additional_kwargs = additional_kwargs.split(",")
+                    for key in additional_kwargs:
+                        if key in batch.non_tensor_batch:
+                            non_tensor_batch_keys_to_pop.append(key)
 
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
